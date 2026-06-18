@@ -1,0 +1,43 @@
+# Environment secrets
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+aporia/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+.research_agent_cache/
+research_state.json
+core_algorithm.py
+research_proposal.md
+cursor_prompt.txt
+paper_draft.md
+paper_library.json
+
+# Streamlit
+.streamlit/secrets.toml
+
+# PDFs / data
+papers/
+*.zip
