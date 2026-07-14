@@ -62,7 +62,7 @@ Each phase preserves state via LangGraph's checkpoint system, allowing pause and
 ### Web UI (recommended)
 
 ```bash
-git clone https://github.com/Paradoxtcal/Aporia
+git clone https://github.com/Saytoblue/Aporia
 cd Aporia
 pip install -r requirements.txt
 

@@ -62,7 +62,7 @@ Aporia 是一个 **5 阶段、基于 LangGraph 的多 Agent 流水线**：
 ### Web 界面（推荐）
 
 ```bash
-git clone https://github.com/Paradoxtcal/Aporia
+git clone https://github.com/Saytoblue/Aporia
 cd Aporia
 pip install -r requirements.txt
 
