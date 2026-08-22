@@ -92,7 +92,7 @@ python main.py --resume SESSION_ID
 用户输入（课题 + 直觉）
         │
         ▼
-  agents/orchestrator.py   ← LangGraph 状态图（7 节点，3 个人工交互点）
+  agents/orchestrator.py   ← LangGraph 状态图（14 节点，3 个人工交互点）
         │
    ┌────┼────┬────┬────┬────┐
    ▼    ▼    ▼    ▼    ▼    ▼
@@ -107,7 +107,7 @@ dialogue  idea  refine  method  experiment  writing
 
 | 目录 | 用途 |
 |------|------|
-| `agents/` | 7 个 Agent：引导 → 发现 → 精炼 → 方法 → 实验 → 写作 |
+| `agents/` | 6 个 Agent：引导 → 发现 → 精炼 → 方法 → 实验 → 写作 |
 | `tools/` | 外部 API 调用：Semantic Scholar、arXiv、GitHub、PapersWithCode |
 | `utils/` | 基础设施：ResearchState（TypedDict）、LLM 客户端工厂、检查点持久化 |
 | `prompts/` | 各 Agent 的 Prompt 模板 |

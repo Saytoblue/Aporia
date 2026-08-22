@@ -92,7 +92,7 @@ The CLI opens with a single question. Answer naturally — there's no form to fi
 User Input (topic + intuition)
         │
         ▼
-  agents/orchestrator.py   ← LangGraph state graph (7 nodes, 3 interrupt points)
+  agents/orchestrator.py   ← LangGraph state graph (14 nodes, 3 interrupt points)
         │
    ┌────┼────┬────┬────┬────┐
    ▼    ▼    ▼    ▼    ▼    ▼
@@ -107,7 +107,7 @@ dialogue  idea  refine  method  experiment  writing
 
 | Directory | Purpose |
 |-----------|---------|
-| `agents/` | 7 agents: elicitation → discovery → refinement → method → experiment → writing |
+| `agents/` | 6 agents: elicitation → discovery → refinement → method → experiment → writing |
 | `tools/` | External API calls: Semantic Scholar, arXiv, GitHub, PapersWithCode |
 | `utils/` | Infrastructure: `ResearchState` (TypedDict), LLM client factory, checkpoint persistence |
 | `prompts/` | Prompt templates for each agent |
