@@ -86,6 +86,8 @@ The CLI opens with a single question. Answer naturally — there's no form to fi
 
 ## Architecture
 
+![Aporia system architecture](assets/system.png)
+
 ```
 User Input (topic + intuition)
         │

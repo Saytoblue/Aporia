@@ -86,6 +86,8 @@ python main.py --resume SESSION_ID
 
 ## 架构
 
+![Aporia 系统架构图](assets/system.png)
+
 ```
 用户输入（课题 + 直觉）
         │
