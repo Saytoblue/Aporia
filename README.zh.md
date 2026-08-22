@@ -18,6 +18,10 @@
 
 </div>
 
+<div align="center">
+  <img src="assets/system.png" alt="Aporia 系统架构图" width="100%"/>
+</div>
+
 ---
 
 ## 为什么需要 Aporia？
@@ -85,8 +89,6 @@ python main.py --resume SESSION_ID
 会话以单个问题开始。自然地回答即可——无需填写任何表单，支持任意语言。
 
 ## 架构
-
-![Aporia 系统架构图](assets/system.png)
 
 ```
 用户输入（课题 + 直觉）

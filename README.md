@@ -18,6 +18,10 @@
 
 </div>
 
+<div align="center">
+  <img src="assets/system.png" alt="Aporia system architecture" width="100%"/>
+</div>
+
 ---
 
 ## Why Aporia?
@@ -85,8 +89,6 @@ python main.py --resume SESSION_ID
 The CLI opens with a single question. Answer naturally — there's no form to fill in. Any language works.
 
 ## Architecture
-
-![Aporia system architecture](assets/system.png)
 
 ```
 User Input (topic + intuition)
