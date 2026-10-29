@@ -13,6 +13,10 @@ from langgraph.graph.message import add_messages
 
 
 class ResearchState(TypedDict, total=False):
+    schema_version: int
+    evidence_catalog: list
+    claim_evidence: list
+    evidence_warnings: list
     messages: Annotated[list, add_messages]
 
     phase: str
@@ -44,15 +48,24 @@ class ResearchState(TypedDict, total=False):
     novelty_score: float
     feasibility_score: float
     research_proposal: str
+    proposal_revision_count: int
 
     baseline_code: str
     core_modification: str
     github_repos: list
 
     session_id: str
+    workflow: str
+    ui_phase: str
     dialogue_turns: int
     checkpoints: list
     metadata: dict
+    node_runs: dict
+    last_node: str
+    last_node_status: str
+    last_node_attempt: int
+    last_node_at: str
+    replayed_nodes: list
 
     user_insight: str
     raw_ideas: list

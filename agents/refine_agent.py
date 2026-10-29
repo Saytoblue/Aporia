@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from utils.state import ResearchState
 from utils.llm_client import get_llm
 from tools.literature_tools import fetch_fulltext_excerpt, load_paper_library, save_paper_library
+from utils.evidence import build_catalog, evidence_prompt, attach_evidence
 from prompts.refine_prompts import (
     ASSUMPTION_BREAKING_PROMPT,
     PROBLEM_REFRAMING_PROMPT,
@@ -118,6 +119,7 @@ def assumption_breaking_node(state: ResearchState) -> ResearchState:
                     "pdf_url": res.get("pdf_url") or paper.get("pdf_url"),
                     "pdf_path": res.get("pdf_path"),
                     "fulltext_excerpt": res.get("text_excerpt", ""),
+                    "fulltext_pages": res.get("pages", []),
                     "fulltext_status": "cached",
                 }
                 updated += 1
@@ -276,6 +278,7 @@ def necessity_check_node(state: ResearchState) -> ResearchState:
 
 def proposal_node(state: ResearchState) -> ResearchState:
     llm = _get_llm(temperature=0.4)
+    catalog = build_catalog(state)
     response = llm.invoke([
         SystemMessage(content=PROPOSAL_PROMPT),
         HumanMessage(content=(
@@ -290,14 +293,44 @@ def proposal_node(state: ResearchState) -> ResearchState:
             "## 4. Datasets & metrics (minimal set that can falsify/validate the core claim)\n"
             "## 5. Ablations (each component maps to one ablation)\n"
             "## 6. Expected results & risks (if the assumption is wrong, what would we observe?)"
+            + evidence_prompt(catalog)
         )),
     ])
 
     print(f"  ✓ Proposal draft generated ({len(response.content)} chars)")
 
     return {
-        **state,
-        "research_proposal": response.content,
+        **attach_evidence(state, response.content, catalog),
+        "phase": "idea_refine",
+    }
+
+
+def proposal_revision_node(state: ResearchState) -> ResearchState:
+    """Revise the proposal from explicit human feedback before another review."""
+    llm = _get_llm(temperature=0.4)
+    feedback = str(state.get("human_feedback", "") or "").strip()
+    catalog = build_catalog(state)
+    response = llm.invoke([
+        SystemMessage(content=PROPOSAL_PROMPT),
+        HumanMessage(content=(
+            f"Current proposal draft:\n{state.get('research_proposal', '')}\n\n"
+            f"Researcher's requested changes:\n{feedback}\n\n"
+            f"Story arc (keep the validated core claim):\n{state.get('story_arc', '')}\n\n"
+            f"Necessity-check results:\n{state.get('method_necessity_check', '')}\n\n"
+            "Revise the proposal to address the requested changes. Preserve the original "
+            "research topic and core insight; do not introduce a new task or unrelated "
+            "dataset. Return the complete revised Markdown proposal, not a change summary."
+            + evidence_prompt(catalog)
+        )),
+    ])
+
+    revision_count = int(state.get("proposal_revision_count", 0) or 0) + 1
+    print(f"  ✓ Proposal revised (revision {revision_count}, {len(response.content)} chars)")
+    return {
+        **attach_evidence(state, response.content, catalog),
+        "proposal_revision_count": revision_count,
+        # The next interrupt is a fresh review, not an approval.
+        "human_feedback": "",
         "phase": "idea_refine",
     }
 

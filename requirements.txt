@@ -35,8 +35,8 @@ cairosvg>=2.9.0
 python-dotenv>=1.2.0     # .env loading
 pydantic>=2.13.0
 
-# Optional: persistent checkpointing
-# langgraph-checkpoint-sqlite>=0.1.0
+# Persistent checkpointing (required for cross-process session recovery)
+langgraph-checkpoint-sqlite>=0.1.0
 # langgraph-checkpoint-postgres>=0.1.0
 
 # Optional: Dify integration

@@ -9,12 +9,27 @@ Supports Semantic Scholar API and arXiv API.
 
 from __future__ import annotations
 import hashlib
+import io
 import os
+import re
+import tempfile
 from pathlib import Path
 import time
 import json
 import xml.etree.ElementTree as ET
 from typing import Optional
+from utils.operations import request_key, load_result, save_result
+from utils.storage import atomic_write_text, named_lock
+
+
+def _search_cache(source, params):
+    try:
+        ttl = max(0.0, float(os.environ.get("RESEARCH_AGENT_SEARCH_CACHE_TTL", "3600")))
+    except ValueError:
+        ttl = 3600.0
+    key = request_key(["search-v1", source, params])
+    found, papers = load_result(key, max_age=ttl) if ttl else (False, None)
+    return key, ttl, found, papers
 
 
 def _stable_id(*parts: str) -> str:
@@ -55,6 +70,9 @@ def search_semantic_scholar(
     """
     base_url = "https://api.semanticscholar.org/graph/v1/paper/search"
     params = {"query": query, "limit": min(limit, 100), "fields": fields}
+    cache_key, ttl, found, cached = _search_cache("semantic_scholar", [params, min_citation])
+    if found:
+        return cached
 
     try:
         import requests
@@ -91,8 +109,6 @@ def search_semantic_scholar(
                 "external_ids": ext,
                 "source": "semantic_scholar",
             })
-        return papers
-
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         detail = ""
@@ -105,6 +121,9 @@ def search_semantic_scholar(
         msg = f"{status} {detail}".strip() if status else str(e)
         print(f"  [WARNING] Semantic Scholar search failed: {msg}")
         return []
+    if ttl:
+        save_result(cache_key, papers)
+    return papers
 
 
 # ──────────────────────────────────────────────
@@ -127,6 +146,9 @@ def search_arxiv_recent(
         "sortBy": sort_by,
         "sortOrder": "descending",
     }
+    cache_key, ttl, found, cached = _search_cache("arxiv", params)
+    if found:
+        return cached
 
     try:
         import requests
@@ -165,11 +187,12 @@ def search_arxiv_recent(
                 "source": "arxiv",
             })
 
-        return papers
-
     except Exception as e:
         print(f"  [WARNING] arXiv search failed: {e}")
         return []
+    if ttl:
+        save_result(cache_key, papers)
+    return papers
 
 
 # ──────────────────────────────────────────────
@@ -194,40 +217,56 @@ def quick_literature_scan(topic: str, top_k: int = 20) -> list[dict]:
     return merged[:top_k]
 
 
+def _valid_pdf(content: bytes) -> bool:
+    if not content.startswith(b"%PDF-") or b"%%EOF" not in content[-1024:]:
+        return False
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(io.BytesIO(content)).pages) > 0
+    except Exception:
+        return False
+
+
 def download_pdf(pdf_url: str, cache_dir: str | Path, filename_hint: str | None = None) -> Path | None:
     if not pdf_url:
         return None
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
-    name = filename_hint or _stable_id(pdf_url)
-    if not name.endswith(".pdf"):
-        name += ".pdf"
+    hint = re.sub(r"[^A-Za-z0-9._-]", "_", filename_hint or "paper")[:80].strip(".") or "paper"
+    name = f"{hint}-{hashlib.sha256(pdf_url.encode('utf-8')).hexdigest()[:16]}.pdf"
     out = cache_path / name
-    if out.exists() and out.stat().st_size > 0:
-        return out
 
     try:
+        if out.exists() and _valid_pdf(out.read_bytes()):
+            return out
         import requests
         r = requests.get(pdf_url, timeout=30, headers={"User-Agent": "Aporia/1.0"})
-        if r.status_code != 200 or not r.content:
+        if r.status_code != 200 or not _valid_pdf(r.content):
             return None
-        out.write_bytes(r.content)
-        if out.stat().st_size < 1024:
-            return None
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", dir=str(cache_path))
+        try:
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(r.content)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, out)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
         return out
     except Exception:
         return None
 
 
-def extract_text_from_pdf(pdf_path: str | Path, max_pages: int | None = 6, max_chars: int = 12000) -> str:
+def extract_pdf_pages(pdf_path: str | Path, max_pages: int | None = 6, max_chars: int = 12000) -> list[dict]:
     try:
         from pypdf import PdfReader
     except Exception:
-        return ""
+        return []
 
     path = Path(pdf_path)
     if not path.exists():
-        return ""
+        return []
 
     try:
         reader = PdfReader(str(path))
@@ -235,21 +274,25 @@ def extract_text_from_pdf(pdf_path: str | Path, max_pages: int | None = 6, max_c
             pages = reader.pages
         else:
             pages = reader.pages[:max_pages]
-        chunks: list[str] = []
+        chunks = []
         total = 0
-        for p in pages:
+        for page_number, p in enumerate(pages, 1):
             txt = (p.extract_text() or "").strip()
             if not txt:
                 continue
             if total + len(txt) > max_chars:
                 txt = txt[: max(0, max_chars - total)]
-            chunks.append(txt)
+            chunks.append({"page": page_number, "text": txt})
             total += len(txt)
             if total >= max_chars:
                 break
-        return "\n\n".join(chunks)
+        return chunks
     except Exception:
-        return ""
+        return []
+
+
+def extract_text_from_pdf(pdf_path: str | Path, max_pages: int | None = 6, max_chars: int = 12000) -> str:
+    return "\n\n".join(p["text"] for p in extract_pdf_pages(pdf_path, max_pages, max_chars))
 
 
 def fetch_fulltext_excerpt(
@@ -276,27 +319,31 @@ def fetch_fulltext_excerpt(
         mc = int(os.environ.get("RESEARCH_AGENT_PDF_MAX_CHARS", "30000")) if max_chars is None else max_chars
     except Exception:
         mc = 30000 if max_chars is None else max_chars
-    excerpt = extract_text_from_pdf(pdf_path, max_pages=mp, max_chars=mc)
-    return {"ok": bool(excerpt), "pdf_url": pdf_url, "pdf_path": str(pdf_path), "text_excerpt": excerpt}
+    pages = extract_pdf_pages(pdf_path, max_pages=mp, max_chars=mc)
+    excerpt = "\n\n".join(p["text"] for p in pages)
+    return {"ok": bool(excerpt), "pdf_url": pdf_url, "pdf_path": str(pdf_path), "text_excerpt": excerpt, "pages": pages}
 
 
 def load_paper_library(cache_root: str | Path | None = None) -> dict:
     cache_root = Path(cache_root or os.environ.get("RESEARCH_AGENT_CACHE_DIR", ".research_agent_cache"))
     path = cache_root / "paper_library.json"
-    try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    if not path.exists():
         return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid paper library: {path}. Expected a JSON object; restore the file before retrying.")
+    return data
 
 
 def save_paper_library(library: dict, cache_root: str | Path | None = None) -> None:
     cache_root = Path(cache_root or os.environ.get("RESEARCH_AGENT_CACHE_DIR", ".research_agent_cache"))
     cache_root.mkdir(parents=True, exist_ok=True)
     path = cache_root / "paper_library.json"
-    try:
-        path.write_text(json.dumps(library, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        return
+    with named_lock("paper-library:" + str(path.resolve()), blocking=True):
+        merged = load_paper_library(cache_root)
+        for pid, entry in library.items():
+            previous = merged.get(pid) or {}
+            # A stale session must not erase another session's downloaded text.
+            merged[pid] = {**previous, **{key: value for key, value in entry.items()
+                                        if value or key not in previous}}
+        atomic_write_text(path, json.dumps(merged, ensure_ascii=False, indent=2))

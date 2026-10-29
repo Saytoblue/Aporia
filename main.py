@@ -7,6 +7,10 @@ Aporia — CLI
 """
 
 import os, sys, json, argparse
+import tempfile
+from utils.artifacts import save_artifacts, save_failure_message
+from utils.session_runtime import checkpoint_id
+from utils.storage import output_dir, SessionBusyError, StaleSessionError
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -30,6 +34,7 @@ UI = {
     "rate_limit_wait": "❌ LLM rate-limited/quota exceeded: wait about {s:.0f}s and retry.",
     "rate_limit_generic": "❌ LLM rate-limited/quota exceeded: retry later or switch model/key.",
     "resume_hint": "   You can run with --resume {sid} to continue the same session.",
+    "session_id": "   Session ID: {sid}",
     "directions_found": "Found 3 candidate directions (each breaks a different assumption):",
     "broken_assumption": "Broken assumption: {v}",
     "one_line": "One-liner: {v}",
@@ -94,7 +99,7 @@ def _snapshot_write(session_id: str, kind: str, ext: str, content: str) -> None:
         if not content:
             return
         sid = (session_id or "unknown").strip() or "unknown"
-        out_dir = _autosave_root() / sid
+        out_dir = output_dir(sid)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         pattern = f"*_{kind}.{ext}"
@@ -108,68 +113,50 @@ def _snapshot_write(session_id: str, kind: str, ext: str, content: str) -> None:
             except Exception:
                 pass
 
-        name = f"{_utc_stamp()}_{kind}.{ext}"
-        (out_dir / name).write_text(content, encoding="utf-8")
-    except Exception:
-        pass
+        name = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}_{kind}.{ext}"
+        _atomic_write_text(out_dir / name, content)
+    except Exception as exc:
+        print(f"Snapshot save failed: {exc}", file=sys.stderr)
+
+
+def _atomic_write_text(path: str | Path, content: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{p.name}.", dir=str(p.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, p)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
 
 
 def _write_if_changed(path: str, content: str) -> None:
-    try:
-        p = Path(path)
-        if p.exists():
-            prev = p.read_text(encoding="utf-8")
-            if prev == content:
-                return
-        p.write_text(content, encoding="utf-8")
-    except Exception:
-        pass
+    p = Path(path)
+    if p.exists() and p.read_text(encoding="utf-8") == content:
+        return
+    _atomic_write_text(p, content)
 
 
 def _autosave_partial(state: dict) -> None:
-    if not isinstance(state, dict):
-        return
-    session_id = str(state.get("session_id") or "")
-
-    proposal = state.get("research_proposal", "") or ""
-    story = state.get("story_arc", "") or ""
-    necessity = state.get("method_necessity_check", "") or ""
-    parts = [story, necessity, proposal]
-    parts = [p.strip() for p in parts if (p or "").strip()]
-    if parts:
-        proposal_text = "\n\n---\n\n".join(parts) + "\n"
-        _write_if_changed("research_proposal.md", proposal_text)
-        _snapshot_write(session_id, "research_proposal", "md", proposal_text)
-
-    code = state.get("core_modification", "") or ""
-    if code.strip():
-        header = (
-            f"# Aporia — Core Algorithm\n"
-            f"# Direction: {state.get('selected_direction', {}).get('name', '')}\n"
-            f"# Broken assumption: {state.get('broken_assumption', '')}\n\n"
-        )
-        code_text = header + code
-        _write_if_changed("core_algorithm.py", code_text)
-        _snapshot_write(session_id, "core_algorithm", "py", code_text)
-
-    integration = (state.get("metadata", {}) or {}).get("integration_prompt", "") or ""
-    if integration.strip():
-        _write_if_changed("cursor_prompt.txt", integration)
-        _snapshot_write(session_id, "cursor_prompt", "txt", integration)
-
-    try:
-        state_text = json.dumps(_safe_json_state(state), ensure_ascii=False, indent=2) + "\n"
-    except Exception:
-        state_text = json.dumps({"_autosaved_at_utc": datetime.now(timezone.utc).isoformat()}, ensure_ascii=False, indent=2) + "\n"
-    _write_if_changed("research_state.json", state_text)
+    report = save_artifacts(state)
+    if report["failed"]:
+        print(save_failure_message(report), file=sys.stderr)
+    return report
 
 
 def _autosave_from_graph(graph, config) -> None:
     try:
-        st = graph.get_state(config).values
-    except Exception:
-        return
-    _autosave_partial(st)
+        from utils.storage import session_lock
+        with session_lock(config["configurable"]["thread_id"]):
+            st = graph.get_state(config).values
+            st = {**st, "session_id": config["configurable"]["thread_id"]}
+            _autosave_partial(st)
+    except Exception as exc:
+        print(f"Cannot read checkpoint for output saving: {exc}", file=sys.stderr)
 
 
 def _has_real_key(v: str | None) -> bool:
@@ -331,7 +318,142 @@ def check_env():
         sys.exit(1)
 
 
-def run():
+def _get_snapshot(graph, config):
+    snapshot = graph.get_state(config)
+    values = getattr(snapshot, "values", None) or {}
+    next_nodes = tuple(getattr(snapshot, "next", None) or ())
+    return snapshot, values, next_nodes
+
+
+def _last_assistant_message(state: dict) -> str:
+    for message in reversed(state.get("messages", []) or []):
+        if isinstance(message, dict):
+            if message.get("role") == "assistant":
+                return str(message.get("content", "") or "")
+            continue
+        if getattr(message, "type", "") == "ai":
+            return str(getattr(message, "content", "") or "")
+    return ""
+
+
+def _pending_interaction(state: dict, next_nodes: tuple[str, ...]) -> str | None:
+    next_set = set(next_nodes)
+    if "human_direction_select" in next_set:
+        return "direction_select"
+    if "human_proposal_review" in next_set:
+        return "proposal_review"
+    if "human_elicit_continue" in next_set:
+        return "elicit_continue"
+    if state.get("candidate_directions") and not state.get("selected_direction"):
+        return "direction_select"
+    if (
+        state.get("research_proposal")
+        and not state.get("core_modification")
+        and not _is_approved(state.get("human_feedback"))
+    ):
+        return "proposal_review"
+    if not next_set and state.get("core_modification"):
+        return "done"
+    return None
+
+
+def _stream_until_pause(graph, config, last_ai: str):
+    """Advance the graph and return (latest assistant text, should_continue)."""
+    while True:
+        try:
+            for event in graph.stream(None, config, stream_mode="values"):
+                for message in reversed(event.get("messages", []) or []):
+                    if isinstance(message, dict):
+                        if message.get("role") != "assistant":
+                            continue
+                        content = str(message.get("content", "") or "")
+                    elif getattr(message, "type", "") == "ai":
+                        content = str(getattr(message, "content", "") or "")
+                    else:
+                        continue
+                    if content and content != last_ai and not _is_internal_marker(content):
+                        print(f"\nAI: {content}\n")
+                        last_ai = content
+                    break
+
+                if event.get("friction_points") and not event.get("candidate_directions"):
+                    print(f"\n{UI['searching']}\n")
+                if event.get("core_modification"):
+                    _save_outputs(event)
+                _autosave_from_graph(graph, config)
+            return last_ai, True
+        except Exception as e:
+            _autosave_from_graph(graph, config)
+            if _handle_rate_limit_error(e, config=config):
+                continue
+            if _handle_llm_config_error(e, config=config):
+                return last_ai, False
+            raise
+
+
+def _handle_direction_selection(graph, config) -> bool:
+    state = graph.get_state(config).values
+    directions = state.get("candidate_directions", []) or []
+    _print_directions(directions)
+    choice = input("\n" + UI["direction_pick"] + "\n> ").strip()
+    if choice in ("1", "2", "3") and len(directions) >= int(choice):
+        selected = directions[int(choice) - 1]
+    else:
+        selected = {
+            "name": choice,
+            "broken_assumption": choice,
+            "one_line": choice,
+            "rationale": "",
+            "reframed_problem": "",
+        }
+
+    raw_papers = state.get("raw_papers", []) or []
+    if raw_papers:
+        _print_papers(raw_papers[:10])
+        pick = input("\n" + UI["pick_fulltext"] + "\n> ").strip()
+        paper_ids = _parse_paper_picks(pick, raw_papers[:10])
+    else:
+        paper_ids = []
+
+    changes = {
+        "selected_direction": selected,
+        "paper_fulltext_request": paper_ids,
+        # Choosing a direction is distinct from approving the later proposal.
+        # Keep this empty so route_after_proposal reaches its review gate.
+        "human_feedback": "",
+    }
+    print("\n" + UI["direction_selected"].format(name=selected.get("name", choice)))
+    print(UI["building_story"] + "\n")
+    return changes
+
+
+def _handle_proposal_review(graph, config) -> bool:
+    state = graph.get_state(config).values
+    print("\n" + "─" * 50)
+    print(UI["proposal_ready"] + "\n")
+    print((state.get("research_proposal") or "")[:800])
+    print("\n" + UI["proposal_hint"])
+
+    raw_papers = state.get("raw_papers", []) or []
+    if raw_papers:
+        _print_papers(raw_papers[:10])
+        pick = input("\n" + UI["pick_fulltext_before_code"] + "\n> ").strip()
+        paper_ids = _parse_paper_picks(pick, raw_papers[:10])
+    else:
+        paper_ids = []
+    feedback = input(f"{UI['you']}: ").strip() or "approved"
+    changes = {
+        "human_feedback": feedback,
+        "paper_fulltext_request": paper_ids,
+    }
+    if _is_approved(feedback):
+        print("\n" + UI["generating_code"] + "\n")
+    else:
+        print("\nRevising the proposal from your feedback...\n")
+    return changes
+
+
+def run(resume_session_id: str | None = None):
     print("\n" + "="*58)
     print("  Aporia")
     print("  Your Phase-0 AI research partner: turn vague instincts into core algorithms")
@@ -343,169 +465,91 @@ def run():
     if model:
         print(f"LLM: provider={provider} model={model}\n")
 
-    topic = input(UI["topic_prompt"] + "\n> ").strip() or "TBD"
+    from agents.orchestrator import resume_session, start_dialogue
 
-    from agents.orchestrator import start_dialogue, build_graph
-    try:
-        graph, config, q = start_dialogue(topic, user_language="Auto")
-    except Exception as e:
-        if _handle_llm_config_error(e):
+    if resume_session_id:
+        try:
+            graph, config = resume_session(resume_session_id)
+            snapshot, state, next_nodes = _get_snapshot(graph, config)
+            expected = checkpoint_id(snapshot)
+        except Exception as e:
+            print(f"\n❌ Unable to resume session: {e}")
             return
-        raise
-    _autosave_from_graph(graph, config)
-    print(f"\nAI: {q}\n")
-    last_ai = q or ""
-    last_saved = {"proposal": "", "story": "", "dirs": 0}
+        sid = (config.get("configurable") or {}).get("thread_id", resume_session_id)
+        print(f"\nResuming session: {sid}")
+        print(f"Phase: {state.get('phase', 'unknown')}")
+        if next_nodes:
+            print(f"Next checkpoint: {', '.join(next_nodes)}")
+        last_ai = _last_assistant_message(state)
+        if last_ai:
+            print(f"\nAI: {last_ai}\n")
+        _autosave_from_graph(graph, config)
+    else:
+        topic = input(UI["topic_prompt"] + "\n> ").strip() or "TBD"
+        try:
+            graph, config, q = start_dialogue(topic, user_language="Auto")
+        except Exception as e:
+            if _handle_llm_config_error(e):
+                return
+            raise
+        _autosave_from_graph(graph, config)
+        sid = (config.get("configurable") or {}).get("thread_id")
+        if sid:
+            print(UI["session_id"].format(sid=sid))
+        print(f"\nAI: {q}\n")
+        last_ai = q or ""
 
     while True:
         try:
-            ans = input(f"{UI['you']}: ").strip()
+            snapshot, state, next_nodes = _get_snapshot(graph, config)
+            expected = checkpoint_id(snapshot)
+            pending = _pending_interaction(state, next_nodes)
+
+            if pending == "done":
+                with graph.session(config, expected_checkpoint=expected):
+                    _save_outputs(state)
+                print("Session is already complete.")
+                break
+
+            if pending == "direction_select":
+                changes = _handle_direction_selection(graph, config)
+            elif pending == "proposal_review":
+                changes = _handle_proposal_review(graph, config)
+            elif pending == "elicit_continue":
+                ans = input(f"{UI['you']}: ").strip()
+                if not ans:
+                    continue
+                changes = {
+                    "human_feedback": ans,
+                    "messages": [{"role": "user", "content": ans}],
+                }
+            else:
+                # A crash may have happened between checkpoints. Continue the
+                # persisted graph until it reaches its next human gate.
+                with graph.session(config, expected_checkpoint=expected):
+                    last_ai, should_continue = _stream_until_pause(graph, config, last_ai)
+                if not should_continue:
+                    return
+                continue
+
+            with graph.session(config, expected_checkpoint=expected):
+                graph.update_state(config, changes)
+                _autosave_from_graph(graph, config)
+                last_ai, should_continue = _stream_until_pause(graph, config, last_ai)
+            if not should_continue:
+                return
+        except (SessionBusyError, StaleSessionError) as exc:
+            print(str(exc), file=sys.stderr)
+            return
         except KeyboardInterrupt:
             _autosave_from_graph(graph, config)
             print("\n")
             break
-        if not ans:
-            continue
-
-        graph.update_state(config, {
-            "human_feedback": ans,
-            "messages": [{"role": "user", "content": ans}],
-        })
-        _autosave_from_graph(graph, config)
-
-        stopped_at = None
-        while True:
-            try:
-                for event in graph.stream(None, config, stream_mode="values"):
-                    msgs = event.get("messages", [])
-                    for m in reversed(msgs):
-                        if isinstance(m, dict):
-                            if m.get("role") == "assistant":
-                                c = m.get("content", "")
-                                if c and c != last_ai and not _is_internal_marker(c):
-                                    print(f"\nAI: {c}\n")
-                                    last_ai = c
-                                break
-                            continue
-                        msg_type = getattr(m, "type", "")
-                        if msg_type == "ai":
-                            c = getattr(m, "content", "") or ""
-                            if c and c != last_ai and not _is_internal_marker(str(c)):
-                                print(f"\nAI: {c}\n")
-                                last_ai = c
-                            break
-
-                    if event.get("friction_points") and not event.get("candidate_directions"):
-                        print(f"\n{UI['searching']}\n")
-
-                    if event.get("candidate_directions") and not event.get("selected_direction"):
-                        stopped_at = "direction_select"
-                        _print_directions(event["candidate_directions"])
-                        if isinstance(event.get("candidate_directions"), list):
-                            last_saved["dirs"] = max(last_saved["dirs"], len(event.get("candidate_directions") or []))
-                        _autosave_from_graph(graph, config)
-                        break
-
-                    if event.get("research_proposal") and not event.get("core_modification"):
-                        feedback = event.get("human_feedback") or graph.get_state(config).values.get("human_feedback", "")
-                        if not _is_approved(feedback):
-                            stopped_at = "proposal_review"
-                            print("\n" + "─"*50)
-                            print(UI["proposal_ready"] + "\n")
-                            print(event["research_proposal"][:800])
-                            print("\n" + UI["proposal_hint"])
-                            rp = event.get("research_proposal") or ""
-                            if rp and rp != last_saved["proposal"]:
-                                last_saved["proposal"] = rp
-                                _autosave_from_graph(graph, config)
-                            break
-
-                    if event.get("core_modification"):
-                        stopped_at = "done"
-                        _save_outputs(event)
-                        break
-                break
-            except Exception as e:
-                _autosave_from_graph(graph, config)
-                if _handle_rate_limit_error(e, config=config):
-                    continue
-                if _handle_llm_config_error(e, config=config):
-                    return
-                raise
-
-        if stopped_at == "direction_select":
-            directions = graph.get_state(config).values.get("candidate_directions", [])
-            choice = input("\n" + UI["direction_pick"] + "\n> ").strip()
-            if choice in ("1", "2", "3") and len(directions) >= int(choice):
-                sel = directions[int(choice) - 1]
-            else:
-                sel = {"name": choice, "broken_assumption": choice,
-                       "one_line": choice, "rationale": "", "reframed_problem": ""}
-            raw_papers = graph.get_state(config).values.get("raw_papers", []) or []
-            if raw_papers:
-                _print_papers(raw_papers[:10])
-                pick = input("\n" + UI["pick_fulltext"] + "\n> ").strip()
-                paper_ids = _parse_paper_picks(pick, raw_papers[:10])
-            else:
-                paper_ids = []
-            graph.update_state(config, {
-                "selected_direction": sel,
-                "paper_fulltext_request": paper_ids,
-                "human_feedback": "approved",
-            })
+        except Exception as e:
             _autosave_from_graph(graph, config)
-            print("\n" + UI["direction_selected"].format(name=sel.get("name", choice)))
-            print(UI["building_story"] + "\n")
-
-        elif stopped_at == "proposal_review":
-            raw_papers = graph.get_state(config).values.get("raw_papers", []) or []
-            if raw_papers:
-                _print_papers(raw_papers[:10])
-                pick = input("\n" + UI["pick_fulltext_before_code"] + "\n> ").strip()
-                paper_ids = _parse_paper_picks(pick, raw_papers[:10])
-            else:
-                paper_ids = []
-            try:
-                feedback = input(f"{UI['you']}: ").strip() or "approved"
-            except KeyboardInterrupt:
-                print("\n")
-                break
-            graph.update_state(config, {"human_feedback": feedback, "paper_fulltext_request": paper_ids})
-            _autosave_from_graph(graph, config)
-            print("\n" + UI["generating_code"] + "\n")
-
-        elif stopped_at == "done":
-            break
-
-        while True:
-            try:
-                for event in graph.stream(None, config, stream_mode="values"):
-                    if event.get("core_modification"):
-                        _save_outputs(event)
-                        stopped_at = "done"
-                        break
-                    if event.get("candidate_directions") and not event.get("selected_direction"):
-                        stopped_at = "direction_select"
-                        _print_directions(event["candidate_directions"])
-                        break
-                    if event.get("research_proposal") and not event.get("core_modification"):
-                        feedback = event.get("human_feedback") or graph.get_state(config).values.get("human_feedback", "")
-                        if not _is_approved(feedback):
-                            stopped_at = "proposal_review"
-                            break
-                    if event.get("story_arc"):
-                        sa = event.get("story_arc") or ""
-                        if sa and sa != last_saved["story"]:
-                            last_saved["story"] = sa
-                            _autosave_from_graph(graph, config)
-                break
-            except Exception as e:
-                _autosave_from_graph(graph, config)
-                if _handle_rate_limit_error(e, config=config):
-                    continue
-                if _handle_llm_config_error(e, config=config):
-                    return
-                raise
+            if _handle_llm_config_error(e, config=config):
+                return
+            raise
 
 
 
@@ -593,37 +637,10 @@ def _jsonify(v):
 
 
 def _save_outputs(state: dict):
-    print("\n" + "="*58)
-    print(UI["done_files"])
-
-    code = state.get("core_modification", "")
-    with open("core_algorithm.py", "w", encoding="utf-8") as f:
-        f.write(f"# Aporia — Core Algorithm\n")
-        f.write(f"# Direction: {state.get('selected_direction', {}).get('name', '')}\n")
-        f.write(f"# Broken assumption: {state.get('broken_assumption', '')}\n\n")
-        f.write(code)
-    print(UI["file_core"])
-
-    proposal = state.get("research_proposal", "")
-    story = state.get("story_arc", "")
-    necessity = state.get("method_necessity_check", "")
-    with open("research_proposal.md", "w", encoding="utf-8") as f:
-        parts = [story, necessity, proposal]
-        parts = [p.strip() for p in parts if (p or "").strip()]
-        f.write("\n\n---\n\n".join(parts) + ("\n" if parts else ""))
-    print(UI["file_proposal"])
-
-    integration = state.get("metadata", {}).get("integration_prompt", "")
-    if integration:
-        with open("cursor_prompt.txt", "w", encoding="utf-8") as f:
-            f.write(integration)
-        print(UI["file_cursor"])
-
-    clean = _jsonify(state)
-    with open("research_state.json", "w", encoding="utf-8") as f:
-        json.dump(clean, f, ensure_ascii=False, indent=2)
-    print(UI["file_state"])
-    print("="*58 + "\n")
+    report = _autosave_partial(state)
+    for path in report["saved"]:
+        print(f"Saved: {path}")
+    return report
 
 
 if __name__ == "__main__":
@@ -631,6 +648,14 @@ if __name__ == "__main__":
     parser.add_argument("--compress-pdfs", action="store_true")
     parser.add_argument("--pdf-dir", default=".")
     parser.add_argument("--resume", help="Resume session ID")
+    parser.add_argument("--list-sessions", action="store_true")
+    parser.add_argument("--rename", nargs=2, metavar=("SESSION_ID", "NAME"))
+    parser.add_argument("--export", metavar="SESSION_ID")
+    parser.add_argument("--export-path", help="ZIP destination")
+    parser.add_argument("--delete", metavar="SESSION_ID", help="Delete session after creating recovery backup")
+    parser.add_argument("--retry-save", metavar="SESSION_ID", help="Save checkpoint outputs without model calls")
+    parser.add_argument("--clean-cache", action="store_true")
+    parser.add_argument("--cache-days", type=int, default=30)
     args = parser.parse_args()
 
     try:
@@ -647,5 +672,39 @@ if __name__ == "__main__":
         compress_and_zip(input_dir=args.pdf_dir)
         sys.exit(0)
 
+    if args.clean_cache:
+        from utils.operations import clean_cache
+        print(f"Removed {clean_cache(args.cache_days)} expired cache records.")
+        sys.exit(0)
+    if args.list_sessions or args.rename or args.export or args.delete or args.retry_save:
+        from agents.orchestrator import build_graph
+        from utils.sessions import list_sessions, rename_session, export_session, delete_session
+        from utils.memory import close_checkpointer
+        from utils.storage import atomic_write_bytes
+        graph = build_graph()
+        try:
+            if args.list_sessions:
+                for item in list_sessions(graph):
+                    print(f"{item['session_id']}\t{item['title']}\t{item['updated']}")
+            if args.rename:
+                rename_session(graph, *args.rename)
+            if args.export:
+                path = Path(args.export_path) if args.export_path else output_dir(args.export) / "session.zip"
+                atomic_write_bytes(path, export_session(graph, args.export))
+                print(f"Exported: {path}")
+            if args.delete:
+                print(f"Session deleted; recovery files: {delete_session(graph, args.delete)}")
+            if args.retry_save:
+                config = {"configurable": {"thread_id": args.retry_save}}
+                state = graph.get_state(config).values
+                if not state:
+                    raise ValueError("Session not found.")
+                report = _save_outputs({**state, "session_id": args.retry_save})
+                if report["failed"]:
+                    sys.exit(1)
+        finally:
+            close_checkpointer(graph.checkpointer)
+        sys.exit(0)
+
     check_env()
-    run()
+    run(args.resume)

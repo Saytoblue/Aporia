@@ -10,6 +10,7 @@ import os
 import re
 import time
 from langchain_openai import ChatOpenAI
+from utils.operations import model_request_key, load_result, save_result
 
 
 def _clean_key(v: str | None) -> str | None:
@@ -148,6 +149,25 @@ class _RetryingLLM:
         return ("connection refused" in m or "failed to connect" in m) and ("11434" in m or "ollama" in m or "localhost" in m)
 
     def invoke(self, *args, **kwargs):
+        identity = {
+            "provider": self._provider,
+            "model": getattr(self._inner, "model_name", None) or getattr(self._inner, "model", None) or self._model,
+            "temperature": self._temperature,
+            "settings": {name: getattr(self._inner, name, None) for name in (
+                "base_url", "openai_api_base", "max_tokens", "top_p", "model_kwargs",
+            )},
+        }
+        key = model_request_key(identity, args, kwargs)
+        if key is not None:
+            found, response = load_result(key)
+            if found:
+                return response
+        response = self._invoke_with_retry(*args, **kwargs)
+        if key is not None:
+            save_result(key, response)
+        return response
+
+    def _invoke_with_retry(self, *args, **kwargs):
         attempts = 0
         fallback_queue = []
         if self._provider in ("gemini", "google") and self._allow_model_fallback():

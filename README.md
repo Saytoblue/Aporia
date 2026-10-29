@@ -86,7 +86,33 @@ python main.py
 python main.py --resume SESSION_ID
 ```
 
-The CLI opens with a single question. Answer naturally — there's no form to fill in. Any language works.
+The CLI opens with a single question. Answer naturally — there's no form to fill in. Any language works. A local SQLite checkpoint database is used by default, so the printed session ID can be resumed after restarting the process. The Streamlit UI shows the same kind of session ID in the sidebar, stores it in the URL, and can load another session from that sidebar.
+
+The shared execution graph also journals task attempts and successful model
+responses in `RESEARCH_AGENT_CACHE_DIR/operations.sqlite` (default:
+`.research_agent_cache/operations.sqlite`). Resuming the same failed task can reuse
+saved responses; new dialogue turns, new runs and other sessions get fresh model
+calls. Normal dialogue/revision loops are not marked as retries. Literature
+searches share a successful-result cache with a one-hour TTL; set
+`RESEARCH_AGENT_SEARCH_CACHE_TTL=0` to disable that search cache. PDF downloads
+are validated and atomically replaced before reuse.
+
+Keep both the checkpoint database and the cache directory to retain this recovery
+behavior. Responses are stored locally; API keys are not part of journal records.
+This does not guarantee exactly-once remote calls: a crash before a response is
+saved, or simultaneous workers running the same task, can still duplicate calls.
+The journal is local even when a remote checkpoint database is configured.
+
+For an opt-in real-model smoke evaluation of the problem-reframing node, configure
+one LLM provider first and run:
+
+```bash
+python scripts/eval_llm_quality.py --output outputs/llm_eval.json
+```
+
+This makes real API calls. The report records provider/model, latency, raw
+outputs, and basic lexical smoke checks; it is not a substitute for expert
+assessment of scientific quality.
 
 ## Architecture
 
@@ -142,8 +168,49 @@ Built-in retry logic handles rate limiting, network errors, and Gemini model fal
 | `RESEARCH_AGENT_PAPER_LIMIT` | Max papers per search | 60 |
 | `RESEARCH_AGENT_RERANK_CANDIDATES` | Papers to re-rank | 30 |
 | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API key (optional) | — |
+| `DATABASE_URL` | Checkpoint database URL | `sqlite:///.aporia/checkpoints.sqlite` |
+| `APORIA_ALLOW_MEMORY_CHECKPOINTS` | Explicit development-only in-memory fallback | unset |
 
 See `.env.example` for the full list.
+
+## Session management and evidence
+
+CLI and Web outputs are stored in `outputs/<session_id>/`, configurable with
+`RESEARCH_AGENT_AUTOSAVE_DIR`. Failed file saves report paths and can be retried
+from the checkpoint with the Web **Retry saving outputs** button or
+`python main.py --retry-save SESSION_ID`, without model calls. Checkpoint failures
+are reported separately, with retry and reload controls in the Web sidebar.
+
+The sidebar includes history, rename, ZIP export, recoverable deletion and cache
+maintenance. Equivalent CLI commands require no model API key:
+
+- `python main.py --list-sessions`
+- `python main.py --rename SESSION_ID "Study name"`
+- `python main.py --export SESSION_ID --export-path study.zip`
+- `python main.py --delete SESSION_ID`
+- `python main.py --clean-cache --cache-days 30`
+
+Deletion saves state, full checkpoint records and outputs under the cache's
+`.trash/` directory first and reports the recovery path. Recovery currently
+requires manual work; exported ZIP files are readable data bundles, not directly
+importable checkpoint databases. Cache cleanup removes expired shared searches
+and completed operations, skipping busy sessions and retaining failed-task retry
+responses. It does not remove the paper library, PDFs or legacy untagged model results.
+
+Local file locks serialize each session across CLI/Web processes sharing one
+cache directory. Stale browser submissions are rejected and must be reloaded.
+This is not a distributed lock across hosts, including when using PostgreSQL.
+Legacy state is migrated in the read view and persisted on the next normal write,
+preserving pending execution; future schema versions are rejected. PostgreSQL
+connections now enter their context, run setup, and close at process exit.
+
+New PDF extraction retains one-based PDF page positions and source text. Legacy
+text with no page mapping remains explicitly unlocated. Proposal generation and
+revision receive session-scoped evidence IDs, distinguish literature claims from
+hypotheses, and report missing provenance or unknown citations. `evidence.json`
+and the proposal appendix retain claim links, source locations and quotes.
+Links establish traceability, not semantic verification or scientific validity;
+coverage is limited by PDF extraction budgets and the catalog size cap.
 
 ## Scope
 

@@ -86,7 +86,26 @@ python main.py
 python main.py --resume SESSION_ID
 ```
 
-会话以单个问题开始。自然地回答即可——无需填写任何表单，支持任意语言。
+会话以单个问题开始。自然地回答即可——无需填写任何表单，支持任意语言。默认使用本地 SQLite 保存检查点，因此重新启动程序后可以使用终端显示的 session ID 恢复。Streamlit 网页侧边栏也会显示 session ID，并将其放入 URL；刷新网页或重新打开 URL 后可以恢复，也可以在侧边栏加载其他会话。
+
+共享执行图还会把任务尝试次数和模型成功响应保存到
+`RESEARCH_AGENT_CACHE_DIR/operations.sqlite`（默认是
+`.research_agent_cache/operations.sqlite`）。同一失败任务恢复时可以复用已保存的响应；
+新的对话轮次、新一轮运行及其他会话会重新调用模型。正常的对话或修改循环不会被标记为重试。
+文献搜索会缓存成功结果，默认有效期一小时；设置
+`RESEARCH_AGENT_SEARCH_CACHE_TTL=0` 可关闭搜索缓存。PDF 会经过有效性检查，再原子替换缓存文件。
+
+保留检查点数据库和缓存目录，才能保留上述恢复能力。模型响应会存储在本地，日志记录不包含 API 密钥。
+这不能保证远端调用恰好一次：响应尚未保存时发生崩溃，或多个进程同时执行同一任务，仍可能重复调用。
+即使使用远端检查点数据库，这份操作日志仍是本地存储。
+
+如需对真实模型执行可选的质量冒烟评测，先配置一个 LLM provider，再运行：
+
+```bash
+python scripts/eval_llm_quality.py --output outputs/llm_eval.json
+```
+
+该命令会真实调用 API。报告会记录 provider/model、耗时、原始输出和基础词汇检查；这些指标不能替代专家对科学正确性和研究价值的评审。
 
 ## 架构
 
@@ -142,8 +161,43 @@ Aporia 支持 4 种 LLM 后端，在侧边栏下拉切换：
 | `RESEARCH_AGENT_PAPER_LIMIT` | 每次搜索最大论文数 | 60 |
 | `RESEARCH_AGENT_RERANK_CANDIDATES` | 重排序候选数 | 30 |
 | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar API 密钥（可选） | — |
+| `DATABASE_URL` | 检查点数据库 URL | `sqlite:///.aporia/checkpoints.sqlite` |
+| `APORIA_ALLOW_MEMORY_CHECKPOINTS` | 仅开发环境使用的内存回退 | 未设置 |
 
 完整列表见 `.env.example`。
+
+## 会话管理与证据追溯
+
+CLI 和网页的研究产物统一保存在 `outputs/<session_id>/`（可通过
+`RESEARCH_AGENT_AUTOSAVE_DIR` 改变根目录），包括状态、提案、核心代码及证据清单。
+保存失败会显示具体路径；网页可点击 **Retry saving outputs**，CLI 可使用
+`python main.py --retry-save SESSION_ID` 从检查点重新导出，无需再次调用模型。
+检查点写入失败与产物写入失败分别提示；网页也提供检查点重试及重新加载按钮。
+
+网页侧边栏提供历史会话、重命名、ZIP 导出、删除和过期缓存清理。CLI 对应命令：
+
+- `python main.py --list-sessions`
+- `python main.py --rename SESSION_ID "研究名称"`
+- `python main.py --export SESSION_ID --export-path study.zip`
+- `python main.py --delete SESSION_ID`
+- `python main.py --clean-cache --cache-days 30`
+
+管理命令不需要模型密钥。删除前先在缓存目录 `.trash/` 中保存状态、完整检查点记录及产物，
+成功后显示备份路径；目前备份供人工恢复，尚无一键导入。ZIP 导出是可阅读的数据包，
+不是可直接导入运行的检查点数据库。清理仅针对过期共享搜索结果和已完成任务，
+会跳过运行中的会话并保留失败任务的重试响应；不会清理论文库或 PDF。
+旧版未标记会话归属的模型缓存会保留。
+
+同一会话采用本机文件锁，防止 CLI/网页或多个标签页同时运行。
+过期页面提交会被拒绝并提示重新加载。该机制适用于共享同一个本地缓存目录的进程，
+不提供跨主机的分布式锁；配置 PostgreSQL 也不会改变这一点。
+旧 State 在读取时兼容迁移，在下次正常写入时保存版本，保留原有待执行节点；
+遇到高于当前支持版本的状态会拒绝写入。PostgreSQL 连接会正确进入上下文、执行 setup 并在退出时关闭。
+
+新读取的 PDF 保留从 1 开始的 PDF 页位置及原文片段，旧缓存缺页码时标为未定位。
+提案与修订使用当前会话的证据编号，区分文献主张和研究假设；无证据、未知引用或缺少
+结构化主张记录时会显示警告。`evidence.json` 和提案附录记录主张、来源、页码及原文。
+引用关联只代表能定位来源，不代表已自动验证其语义支持或研究结论；覆盖范围还受 PDF 提取预算和证据条数上限影响。
 
 ## 适用范围
 

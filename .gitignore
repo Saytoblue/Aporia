@@ -27,6 +27,7 @@ venv/
 Thumbs.db
 
 # Runtime artifacts
+.aporia/
 .research_agent_cache/
 research_state.json
 core_algorithm.py

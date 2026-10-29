@@ -197,6 +197,7 @@ def paper_expand_node(state: ResearchState) -> ResearchState:
             "pdf_url": res.get("pdf_url") or paper.get("pdf_url"),
             "pdf_path": res.get("pdf_path"),
             "fulltext_excerpt": res.get("text_excerpt", ""),
+            "fulltext_pages": res.get("pages", []),
             "fulltext_status": "cached",
         }
         updated += 1
@@ -503,6 +504,7 @@ def paper_search_node(state: ResearchState) -> ResearchState:
                     "pdf_url": res.get("pdf_url") or paper.get("pdf_url"),
                     "pdf_path": res.get("pdf_path"),
                     "fulltext_excerpt": res.get("text_excerpt", ""),
+                    "fulltext_pages": res.get("pages", []),
                     "fulltext_status": "cached",
                 }
                 updated += 1

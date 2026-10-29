@@ -10,6 +10,7 @@ Run: streamlit run app.py
 import streamlit as st
 import sys
 import os
+import uuid
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -126,6 +127,265 @@ def _build_profile_from_topic_and_insight(topic: str, insight: str) -> dict:
     return {"friction_points": [ins] if ins else [], "motivation": "", "research_taste": ""}
 
 
+@st.cache_resource(show_spinner=False)
+def _web_checkpoint_graph():
+    from utils.web_session import build_web_checkpoint_graph
+
+    return build_web_checkpoint_graph()
+
+
+@st.cache_resource(show_spinner=False)
+def _orchestrator_checkpoint_graph():
+    from agents.orchestrator import build_graph
+
+    return build_graph()
+
+
+def _graph_config(session_id: str) -> dict:
+    return {"configurable": {"thread_id": session_id}}
+
+
+def _graph_phase(graph, config) -> str:
+    snapshot = graph.get_state(config)
+    next_nodes = set(getattr(snapshot, "next", None) or ())
+    if "human_elicit_continue" in next_nodes:
+        return "graph_elicit"
+    if "human_direction_select" in next_nodes:
+        return "graph_direction"
+    if "human_proposal_review" in next_nodes:
+        return "graph_proposal"
+    if not next_nodes and (snapshot.values or {}).get("core_modification"):
+        return "graph_done"
+    return "graph_running"
+
+
+def _stream_graph_until_pause(graph, config):
+    """Run the shared graph until its next human gate or completion."""
+    for _ in graph.stream(None, config, stream_mode="values"):
+        pass
+    return _graph_phase(graph, config)
+
+
+def _last_assistant_message(state: dict) -> str:
+    """Return the latest assistant message from either dict or LangChain form."""
+    for message in reversed(state.get("messages", []) or []):
+        if isinstance(message, dict):
+            if message.get("role") == "assistant":
+                return str(message.get("content", "") or "")
+            continue
+        if getattr(message, "type", "") == "ai":
+            return str(getattr(message, "content", "") or "")
+    return ""
+
+
+def _refresh_graph_state(graph, config, phase: str) -> dict:
+    """Copy the checkpoint values into Streamlit and attach its UI phase."""
+    from utils.session_runtime import checkpoint_id
+    snapshot = graph.get_state(config)
+    st.session_state["_checkpoint_id"] = checkpoint_id(snapshot)
+    state = dict(snapshot.values or {})
+    state["ui_phase"] = phase
+    st.session_state.state = state
+    st.session_state.phase = phase
+    return state
+
+
+def _query_session_id() -> str:
+    try:
+        value = st.query_params.get("session_id", "")
+    except Exception:
+        return ""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def _set_query_session_id(session_id: str) -> None:
+    try:
+        st.query_params["session_id"] = session_id
+    except Exception:
+        pass
+
+
+def _load_web_session(session_id: str) -> tuple[dict, str]:
+    graph = _orchestrator_checkpoint_graph()
+    config = _graph_config(session_id)
+    snapshot = graph.get_state(config)
+    from utils.session_runtime import checkpoint_id
+    values = dict(getattr(snapshot, "values", None) or {})
+    if values.get("workflow") == "orchestrator":
+        st.session_state["_checkpoint_id"] = checkpoint_id(snapshot)
+        st.session_state["graph_mode"] = "orchestrator"
+        saved_phase = str(values.get("ui_phase", "graph_running"))
+        # A graph checkpoint can be newer than the last UI write if the
+        # process stopped between graph.stream() and _persist_web_session().
+        # Human-gate pages must therefore be derived from snapshot.next.
+        if saved_phase in ("experiment", "writing"):
+            phase = saved_phase
+        else:
+            phase = _graph_phase(graph, config)
+        values["ui_phase"] = phase
+        return values, phase
+
+    from utils.web_session import load_web_state
+
+    st.session_state["graph_mode"] = "legacy"
+    legacy = _web_checkpoint_graph()
+    result = load_web_state(legacy, session_id)
+    st.session_state["_checkpoint_id"] = checkpoint_id(legacy.get_state(config))
+    return result
+
+
+def _persist_web_session() -> None:
+    session_id = str(st.session_state.get("session_id", "") or "").strip()
+    state = st.session_state.get("state") or {}
+    phase = str(st.session_state.get("phase", "input") or "input")
+    if not session_id or not state:
+        return
+    try:
+        from utils.session_runtime import checkpoint_id
+        if st.session_state.get("graph_mode") == "orchestrator":
+            graph = _orchestrator_checkpoint_graph()
+            payload = dict(state)
+            payload.pop("messages", None)
+            payload["ui_phase"] = phase
+            config = _graph_config(session_id)
+            with graph.session(config, st.session_state.get("_checkpoint_id")):
+                current = graph.get_state(config).values
+                if any(current.get(key) != value for key, value in payload.items()):
+                    graph.update_state(config, payload)
+                st.session_state["_checkpoint_id"] = checkpoint_id(graph.get_state(config))
+                _save_web_outputs(state)
+        else:
+            from utils.web_session import save_web_state
+            graph = _web_checkpoint_graph()
+            config = _graph_config(session_id)
+            with graph.session(config, st.session_state.get("_checkpoint_id")):
+                current = graph.get_state(config).values
+                payload = {**state, "session_id": session_id, "workflow": "streamlit", "ui_phase": phase}
+                payload.pop("messages", None)
+                if any(current.get(key) != value for key, value in payload.items()):
+                    save_web_state(graph, session_id, state, phase)
+                st.session_state["_checkpoint_id"] = checkpoint_id(graph.get_state(config))
+                _save_web_outputs(state)
+        st.session_state.pop("_persistence_error", None)
+        return True
+    except Exception as exc:
+        st.session_state["_persistence_error"] = str(exc)
+        return False
+
+
+def _save_web_outputs(state):
+    from utils.artifacts import save_artifacts, save_failure_message
+    report = save_artifacts(state, st.session_state.session_id)
+    st.session_state["_artifact_save_error"] = save_failure_message(report)
+    return report
+
+
+def _continue_graph(graph, config, changes=None):
+    """Protect the human update and subsequent execution from other tabs."""
+    with graph.session(config, st.session_state.get("_checkpoint_id")):
+        if changes:
+            graph.update_state(config, changes)
+        try:
+            phase = _stream_graph_until_pause(graph, config)
+        finally:
+            # Also refresh after a node fails so Retry resumes the newer checkpoint.
+            _refresh_graph_state(graph, config, _graph_phase(graph, config))
+            _save_web_outputs(st.session_state.state)
+        _persist_web_session()
+        return phase
+
+
+def _render_evidence(state):
+    with st.expander("Literature evidence and research hypotheses", expanded=False):
+        from utils.evidence import evidence_appendix
+        st.markdown(evidence_appendix(state))
+
+
+def _run_ui_node(fn, state):
+    """Apply the same session guard to optional experiment/writing nodes."""
+    graph = (_orchestrator_checkpoint_graph() if st.session_state.get("graph_mode") == "orchestrator"
+             else _web_checkpoint_graph())
+    config = _graph_config(st.session_state.session_id)
+    from utils.storage import SessionBusyError, StaleSessionError
+    try:
+        with graph.session(config, st.session_state.get("_checkpoint_id")):
+            updated = fn(state)
+            metadata = dict(updated.get("metadata") or {})
+            completed = list(metadata.get("ui_completed_nodes") or [])
+            if fn.__name__ not in completed:
+                completed.append(fn.__name__)
+            metadata["ui_completed_nodes"] = completed
+            updated = {**updated, "metadata": metadata}
+            st.session_state.state = updated
+            if not _persist_web_session():
+                raise RuntimeError("Checkpoint save failed: " + st.session_state["_persistence_error"])
+            return updated
+    except (SessionBusyError, StaleSessionError) as exc:
+        st.error(str(exc))
+        st.stop()
+
+
+def _compose_draft(state):
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from utils.llm_client import get_llm
+    from utils.evidence import evidence_prompt
+    llm = get_llm(temperature=0.6)
+    sections = ["abstract", "introduction", "related_work", "method", "experiments", "conclusion"]
+    drafts = {}
+    progress = st.progress(0, text="Preparing to write...")
+    for i, section in enumerate(sections):
+        progress.progress(int((i + 1) / len(sections) * 100), text=f"Composing {section} section...")
+        response = llm.invoke([
+            SystemMessage(content=f"Write the {section} section in the user's language. Distinguish hypotheses from observed results."),
+            HumanMessage(content=f"Outline: {state.get('paper_outline', '')[:600]}\nStory arc: {state.get('story_arc', '')[:400]}\n"
+                         + evidence_prompt(state.get("evidence_catalog", []))),
+        ])
+        drafts[section] = response.content
+    return {**state, "draft_sections": drafts,
+            "full_draft": "\n\n".join(f"## {s.upper()}\n\n{drafts[s]}" for s in sections)}
+
+
+def _legacy_profile_node(state):
+    if state.get("friction_points"):
+        return state
+    profile = _build_profile_from_topic_and_insight(state.get("topic", ""), state.get("user_insight", ""))
+    return {**state, "friction_points": profile.get("friction_points", []) or [],
+            "motivation": state.get("motivation") or profile.get("motivation", ""),
+            "research_taste": state.get("research_taste") or profile.get("research_taste", "")}
+
+
+def _clear_session_widgets():
+    for key in list(st.session_state):
+        if key.startswith("graph_") and key != "graph_mode":
+            st.session_state.pop(key, None)
+    for key in ("_checkpoint_id", "_artifact_save_error", "_persistence_error", "_selected_dir_idx", "_start_validation_requested", "_research_started_notice"):
+        st.session_state.pop(key, None)
+
+
+def _initialise_web_session() -> None:
+    if "session_id" in st.session_state:
+        return
+
+    requested_id = _query_session_id()
+    if requested_id:
+        try:
+            state, phase = _load_web_session(requested_id)
+            st.session_state.state = state
+            st.session_state.phase = phase
+            st.session_state.session_id = requested_id
+            return
+        except Exception as exc:
+            st.session_state["_resume_error"] = str(exc)
+
+    st.session_state.state = {}
+    st.session_state.phase = "input"
+    st.session_state.session_id = str(uuid.uuid4())
+    st.session_state.graph_mode = "pending"
+    _set_query_session_id(st.session_state.session_id)
+
+
 # ──────────────────────────────────────────────
 # Page config
 # ──────────────────────────────────────────────
@@ -136,6 +396,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+_initialise_web_session()
 
 # ──────────────────────────────────────────────
 # Global custom CSS — deep space blue theme
@@ -490,7 +752,12 @@ _BREADCRUMB_STEPS = [
 _BREADCRUMB_IDX = {
     "input": 0,
     "running": 1,
+    "graph_elicit": 1,
+    "graph_running": 1,
+    "graph_direction": 2,
     "idea_select": 2,
+    "graph_proposal": 3,
+    "graph_done": 4,
     "refining": 3,
     "experiment": 4,
     "writing": 5,
@@ -561,11 +828,135 @@ st.markdown(
 )
 
 # ──────────────────────────────────────────────
-# Sidebar: collapsible config + progress timeline
+# Sidebar helpers: keep session tools secondary to model setup
 # ──────────────────────────────────────────────
 
+def _render_session_controls():
+    st.caption("This ID is backed by the local checkpoint database.")
+    st.code(st.session_state.session_id, language="text")
+    resume_id = st.text_input(
+        "Load another session",
+        value="",
+        placeholder="Paste a session ID",
+        key="resume_session_input",
+    )
+    if st.button("Load session", use_container_width=True, disabled=not resume_id.strip()):
+        try:
+            _clear_session_widgets()
+            loaded_state, loaded_phase = _load_web_session(resume_id.strip())
+            st.session_state.state = loaded_state
+            st.session_state.phase = loaded_phase
+            st.session_state.session_id = resume_id.strip()
+            st.session_state.pop("_resume_error", None)
+            st.session_state.pop("_selected_dir_idx", None)
+            _set_query_session_id(st.session_state.session_id)
+            st.rerun()
+        except Exception as exc:
+            st.session_state["_resume_error"] = str(exc)
+    if st.button("New session", use_container_width=True):
+        _clear_session_widgets()
+        st.session_state.state = {}
+        st.session_state.phase = "input"
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.graph_mode = "pending"
+        st.session_state.pop("_selected_dir_idx", None)
+        st.session_state.pop("_resume_error", None)
+        _set_query_session_id(st.session_state.session_id)
+        st.rerun()
+    if st.session_state.get("_resume_error"):
+        st.warning(st.session_state["_resume_error"])
+    if st.button("Reload current session", disabled=not bool(st.session_state.state)):
+        try:
+            sid = st.session_state.session_id
+            _clear_session_widgets()
+            state, phase = _load_web_session(sid)
+            st.session_state.state, st.session_state.phase = state, phase
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+    _render_session_history()
+
+
+def _render_save_status():
+    # Save failures must remain visible even when session tools are collapsed.
+    if st.session_state.get("_persistence_error"):
+        st.warning("Checkpoint save failed: " + st.session_state["_persistence_error"])
+        if st.button("Retry checkpoint save"):
+            _persist_web_session()
+            st.rerun()
+    if st.session_state.get("_artifact_save_error"):
+        st.warning(st.session_state["_artifact_save_error"])
+        if st.button("Retry saving outputs"):
+            try:
+                graph = (_orchestrator_checkpoint_graph() if st.session_state.get("graph_mode") == "orchestrator"
+                         else _web_checkpoint_graph())
+                config = _graph_config(st.session_state.session_id)
+                with graph.session(config):
+                    _save_web_outputs(graph.get_state(config).values)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
+def _render_session_history():
+    with st.expander("Session history and maintenance", expanded=False):
+        from utils.sessions import list_sessions, rename_session, export_session, delete_session
+        try:
+            manager_graph = _orchestrator_checkpoint_graph()
+            history = list_sessions(manager_graph)
+            options = {item["session_id"]: item for item in history}
+            if options:
+                history_id = st.selectbox("Saved sessions", list(options),
+                    format_func=lambda sid: f"{options[sid]['title']} · {sid}")
+                if st.button("Open selected session"):
+                    _clear_session_widgets()
+                    state, phase = _load_web_session(history_id)
+                    st.session_state.state, st.session_state.phase = state, phase
+                    st.session_state.session_id = history_id
+                    _set_query_session_id(history_id)
+                    st.rerun()
+                title = st.text_input("Session name", value=options[history_id]["title"], key="session_title_" + history_id)
+                if st.button("Rename selected session"):
+                    rename_session(manager_graph, history_id, title)
+                    st.rerun()
+                if st.button("Prepare session export"):
+                    bundle = export_session(manager_graph, history_id)
+                    st.download_button("Download session ZIP", bundle, file_name="aporia-session.zip", mime="application/zip")
+                delete_confirmed = st.checkbox("Delete selected session (a recovery backup will be kept)", key="delete_confirm_" + history_id)
+                if st.button("Delete selected session", disabled=not delete_confirmed):
+                    recovery = delete_session(manager_graph, history_id)
+                    if history_id == st.session_state.session_id:
+                        _clear_session_widgets()
+                        st.session_state.state = {}
+                        st.session_state.phase = "input"
+                        st.session_state.graph_mode = "pending"
+                        st.session_state.session_id = str(uuid.uuid4())
+                        _set_query_session_id(st.session_state.session_id)
+                    st.session_state["_maintenance_message"] = f"Deleted session; recovery files: {recovery}"
+                    st.rerun()
+            else:
+                st.caption("No saved sessions yet.")
+            if st.button("Clean completed cache older than 30 days"):
+                from utils.operations import clean_cache
+                st.session_state["_maintenance_message"] = f"Removed {clean_cache(30)} cache records."
+            if st.session_state.get("_maintenance_message"):
+                st.info(st.session_state["_maintenance_message"])
+        except Exception as exc:
+            st.warning(f"Session maintenance unavailable: {exc}")
+
+
 with st.sidebar:
-    with st.expander("Configuration", expanded=False):
+    # Model setup is a prerequisite; show it before session IDs and recovery.
+    st.markdown("### Configuration")
+    st.caption("Choose a model provider first, then enter your research topic and intuition.")
+    with st.expander("Model settings", expanded=True):
+        provider_labels = {
+            "deepseek": "DeepSeek",
+            "gemini": "Gemini",
+            "openai": "OpenAI",
+            "anthropic": "Anthropic",
+        }
         default_provider = (os.environ.get("RESEARCH_AGENT_LLM_PROVIDER") or os.environ.get("LLM_PROVIDER") or "deepseek").strip().lower()
         if default_provider not in ("gemini", "openai", "anthropic", "deepseek"):
             default_provider = "deepseek"
@@ -573,6 +964,7 @@ with st.sidebar:
         provider = st.selectbox(
             "LLM Provider",
             options=provider_options,
+            format_func=lambda value: provider_labels[value],
             index=provider_options.index(default_provider) if default_provider in provider_options else 0,
             key="settings_provider",
         )
@@ -610,14 +1002,44 @@ with st.sidebar:
             if model:
                 os.environ["OPENAI_MODEL"] = model
 
-        if provider == "gemini":
-            st.caption(f"Effective: provider=gemini | model={os.environ.get('GEMINI_MODEL') or '(not set)'}")
-        elif provider == "openai":
-            st.caption(f"Effective: provider=openai | model={os.environ.get('OPENAI_MODEL') or '(not set)'}")
-        elif provider == "deepseek":
-            st.caption(f"Effective: provider=deepseek | model={os.environ.get('DEEPSEEK_MODEL') or '(not set)'} | base={os.environ.get('DEEPSEEK_BASE_URL') or '(not set)'}")
+        from utils.llm_client import _clean_key
+
+        key_env = {
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }[provider]
+        # A blank widget must not silently opt in to using a configured secret.
+        entered_api_key = _clean_key(api_key)
+        configured_api_key = _clean_key(os.environ.get(key_env))
+        use_configured_key = False
+        if configured_api_key:
+            use_configured_key = st.checkbox(
+                f"Use configured {provider_labels[provider]} API key (.env / environment)",
+                value=False,
+                key=f"settings_use_configured_{provider}_key",
+                help="Select this explicitly to use the existing key without entering it again. The secret is never displayed.",
+            )
+        api_key = entered_api_key or (configured_api_key if use_configured_key else None)
+        provider_label = provider_labels[provider]
+        key_source = "the sidebar" if entered_api_key else ".env / environment (explicitly selected)"
+        if api_key:
+            st.success(f"API key selected for {provider_label} from {key_source}.")
+            st.caption("Key selected; credentials are checked when the model is called.")
+        elif configured_api_key:
+            st.warning(f"API key required: enter a {provider_label} key above, or explicitly select 'Use configured {provider_label} API key'. An existing key is available but has not been selected.")
         else:
-            st.caption(f"Effective: provider=anthropic | model={os.environ.get('ANTHROPIC_MODEL') or '(not set)'}")
+            st.warning(f"API key required: enter a {provider_label} key above, or configure {key_env} in .env.")
+
+        if provider == "gemini":
+            st.caption(f"Effective: provider={provider_label} | model={os.environ.get('GEMINI_MODEL') or '(not set)'}")
+        elif provider == "openai":
+            st.caption(f"Effective: provider={provider_label} | model={os.environ.get('OPENAI_MODEL') or '(not set)'}")
+        elif provider == "deepseek":
+            st.caption(f"Effective: provider={provider_label} | model={os.environ.get('DEEPSEEK_MODEL') or '(not set)'} | base={os.environ.get('DEEPSEEK_BASE_URL') or '(not set)'}")
+        else:
+            st.caption(f"Effective: provider={provider_label} | model={os.environ.get('ANTHROPIC_MODEL') or '(not set)'}")
         st.caption(
             "paper_min="
             + str(os.environ.get("RESEARCH_AGENT_PAPER_MIN", ""))
@@ -626,6 +1048,11 @@ with st.sidebar:
             + " | rerank_candidates="
             + str(os.environ.get("RESEARCH_AGENT_RERANK_CANDIDATES", ""))
         )
+
+    st.divider()
+    with st.expander("Sessions and recovery", expanded=False):
+        _render_session_controls()
+    _render_save_status()
 
     st.divider()
 
@@ -650,6 +1077,11 @@ with st.sidebar:
 
     _sub_to_canonical = {
         "running":        "idea_discovery",
+        "graph_elicit":   "idea_discovery",
+        "graph_running":  "idea_discovery",
+        "graph_direction":"idea_select",
+        "graph_proposal": "refining",
+        "graph_done":     "experiment",
         "idea_refine":    "refining",
         "done":           None,
     }
@@ -693,6 +1125,9 @@ if "state" not in st.session_state:
 if "phase" not in st.session_state:
     st.session_state.phase = "input"
 
+if st.session_state.pop("_research_started_notice", False):
+    st.success("Research started successfully. The first analysis has finished; continue with the current step below.")
+
 # ──────────────────────────────────────────────
 # Phase: input
 # ──────────────────────────────────────────────
@@ -732,21 +1167,256 @@ if st.session_state.phase == "input":
         unsafe_allow_html=True,
     )
 
-    if st.button("Start", type="primary", disabled=not (topic and user_insight and api_key)):
+    if api_key:
+        st.caption(f"API Key source: {provider_label} · {key_source}. Validity is checked when the model is called.")
+    else:
+        st.caption(f"API Key required: enter a {provider_label} key in Configuration → Model settings, or explicitly select a configured key.")
+
+    start_clicked = st.button("Start", type="primary")
+    if start_clicked:
+        st.session_state["_start_validation_requested"] = True
+    if st.session_state.get("_start_validation_requested"):
+        missing = []
+        if not topic.strip():
+            missing.append("Research direction: enter the topic you want to study in the left field.")
+        if not user_insight.strip():
+            missing.append("Your intuition / experience: add an observation, question, or initial hypothesis in the right field.")
         if not api_key:
-            st.error("Please provide an API key in the sidebar first.")
-        else:
-            st.session_state.state = {
-                "topic": topic,
-                "user_insight": user_insight,
-                "phase": "idea_discovery",
-                "user_language": "Auto",
-            }
-            st.session_state.phase = "running"
-            st.rerun()
+            missing.append(f"API Key: open Configuration → Model settings at the top of the sidebar and enter a {provider_label} key, or explicitly select 'Use configured {provider_label} API key' after configuring {key_env} in .env.")
+        if missing:
+            st.error("Please complete the following before starting:\n\n" + "\n".join(f"- {item}" for item in missing))
+        elif start_clicked:
+            st.session_state.pop("_start_validation_requested", None)
+            with st.status("Starting research — preparing the session...", expanded=True) as start_status:
+                try:
+                    from agents.orchestrator import start_dialogue
+
+                    st.write(f"Inputs accepted. Using {provider} with the API key from {key_source}.")
+                    st.write("Running the initial research analysis. Model responses may take some time; please keep this page open.")
+                    start_status.update(label="Research is starting — waiting for the initial analysis...")
+                    graph, config, _ = start_dialogue(
+                        topic.strip(),
+                        session_id=st.session_state.session_id,
+                        user_language="Auto",
+                        initial_feedback=user_insight.strip(),
+                    )
+                    start_status.update(label="Initial analysis finished — saving session...")
+                    phase = _graph_phase(graph, config)
+                    st.session_state.graph_mode = "orchestrator"
+                    _refresh_graph_state(graph, config, phase)
+                    _persist_web_session()
+                    st.session_state["_research_started_notice"] = True
+                    start_status.update(label="Research started successfully.", state="complete")
+                except Exception as exc:
+                    start_status.update(label="Research could not start. See the error below.", state="error")
+                    st.error(f"Unable to start the research graph: {exc}")
+                else:
+                    st.rerun()
 
 # ──────────────────────────────────────────────
-# Phase: running
+# Phases: the shared LangGraph workflow
+# ──────────────────────────────────────────────
+
+elif st.session_state.phase == "graph_elicit":
+    _render_breadcrumb("graph_elicit")
+    state = st.session_state.state
+    graph = _orchestrator_checkpoint_graph()
+    config = _graph_config(st.session_state.session_id)
+
+    st.markdown('<p class="aporia-step-label">Step 2</p>', unsafe_allow_html=True)
+    st.header("Clarify the research friction")
+    st.caption(f"Topic: {state.get('topic', '')}")
+    question = _last_assistant_message(state)
+    if question:
+        st.info(question)
+
+    answer = st.text_area(
+        "Your answer",
+        placeholder="Describe a concrete example, limitation, or constraint. A short answer is fine.",
+        height=130,
+        key="graph_elicit_answer",
+    )
+    if st.button("Continue analysis", type="primary", disabled=not answer.strip(),
+                 key="elicit_submit_" + str(st.session_state.get("_checkpoint_id"))):
+        try:
+            changes = {
+                "human_feedback": answer.strip(),
+                "messages": [{"role": "user", "content": answer.strip()}],
+            }
+            with st.status("Continuing the research analysis...", expanded=True) as status:
+                status.update(label="Running the shared research graph...")
+                phase = _continue_graph(graph, config, changes)
+                status.update(label="Checkpoint reached.", state="complete")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to continue the research graph: {exc}")
+
+elif st.session_state.phase == "graph_running":
+    _render_breadcrumb("graph_running")
+    state = st.session_state.state
+    graph = _orchestrator_checkpoint_graph()
+    config = _graph_config(st.session_state.session_id)
+
+    st.markdown('<p class="aporia-step-label">Step 2</p>', unsafe_allow_html=True)
+    st.header(f"Analyzing: {state.get('topic', '')}")
+    try:
+        with st.status("Running the shared research graph...", expanded=True) as status:
+            phase = _continue_graph(graph, config)
+            status.update(label="Checkpoint reached.", state="complete")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"The research graph stopped unexpectedly: {exc}")
+
+elif st.session_state.phase == "graph_direction":
+    _render_breadcrumb("graph_direction")
+    state = st.session_state.state
+    graph = _orchestrator_checkpoint_graph()
+    config = _graph_config(st.session_state.session_id)
+    directions = [d for d in (state.get("candidate_directions") or []) if isinstance(d, dict)]
+
+    st.markdown('<p class="aporia-step-label">Step 3</p>', unsafe_allow_html=True)
+    st.header("Choose a research direction")
+    st.caption("This selection is written into the graph state before refinement continues.")
+
+    if directions:
+        labels = [
+            f"{i + 1}. {d.get('name', '')} — {d.get('one_line', '')}"
+            for i, d in enumerate(directions)
+        ]
+        selected_idx = st.radio(
+            "Candidate directions",
+            options=list(range(len(directions))),
+            format_func=lambda i: labels[i],
+            key="graph_direction_idx",
+        )
+        selected = directions[selected_idx]
+        st.markdown(f"**Broken assumption:** {selected.get('broken_assumption', '')}")
+    else:
+        st.warning("No candidate directions were found in this checkpoint.")
+        selected_idx = 0
+        selected = {}
+
+    custom = st.text_area(
+        "Optional custom direction",
+        placeholder="Leave blank to use the selected candidate.",
+        height=90,
+        key="graph_custom_direction",
+    )
+    if custom.strip():
+        selected = {
+            "name": custom.strip(),
+            "broken_assumption": custom.strip(),
+            "one_line": custom.strip(),
+            "rationale": "",
+            "reframed_problem": "",
+        }
+
+    papers = [p for p in (state.get("raw_papers") or []) if isinstance(p, dict)]
+    paper_by_label = {
+        f"{i + 1}. {p.get('title', '')}": p.get("paper_id", "")
+        for i, p in enumerate(papers[:12])
+        if p.get("paper_id")
+    }
+    chosen_labels = st.multiselect(
+        "Optional full-text papers",
+        options=list(paper_by_label),
+        key="graph_direction_papers",
+        help="Only papers with an available PDF will be expanded by the graph.",
+    )
+
+    if st.button("Confirm direction", type="primary", disabled=not selected,
+                 key="direction_submit_" + str(st.session_state.get("_checkpoint_id"))):
+        try:
+            changes = {
+                "selected_direction": selected,
+                "paper_fulltext_request": [paper_by_label[x] for x in chosen_labels],
+                # Direction selection is not proposal approval. Keep this empty
+                # so route_after_proposal still reaches its review checkpoint.
+                "human_feedback": "",
+            }
+            with st.status("Refining the selected direction...", expanded=True) as status:
+                phase = _continue_graph(graph, config, changes)
+                status.update(label="Checkpoint reached.", state="complete")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to continue with this direction: {exc}")
+
+elif st.session_state.phase == "graph_proposal":
+    _render_breadcrumb("graph_proposal")
+    state = st.session_state.state
+    graph = _orchestrator_checkpoint_graph()
+    config = _graph_config(st.session_state.session_id)
+
+    st.markdown('<p class="aporia-step-label">Step 4</p>', unsafe_allow_html=True)
+    st.header("Review the research proposal")
+    if state.get("story_arc"):
+        with st.expander("Story arc", expanded=False):
+            st.markdown(state["story_arc"])
+    st.markdown(state.get("research_proposal", ""))
+    _render_evidence(state)
+    revision_count = int(state.get("proposal_revision_count", 0) or 0)
+    if revision_count:
+        st.caption(f"Revision {revision_count} — review the complete revised proposal below.")
+
+    papers = [p for p in (state.get("raw_papers") or []) if isinstance(p, dict)]
+    paper_by_label = {
+        f"{i + 1}. {p.get('title', '')}": p.get("paper_id", "")
+        for i, p in enumerate(papers[:12])
+        if p.get("paper_id")
+    }
+    chosen_labels = st.multiselect(
+        "Optional full-text papers before code generation",
+        options=list(paper_by_label),
+        key="graph_proposal_papers",
+    )
+    feedback = st.text_area(
+        "Your review",
+        placeholder="Type approved, or describe what should be changed.",
+        height=110,
+        key="graph_proposal_feedback",
+    )
+    if st.button("Submit proposal review", type="primary", disabled=not feedback.strip(),
+                 key="proposal_submit_" + str(st.session_state.get("_checkpoint_id"))):
+        try:
+            changes = {
+                "human_feedback": feedback.strip(),
+                "paper_fulltext_request": [paper_by_label[x] for x in chosen_labels],
+            }
+            approved = feedback.strip().lower() in ("approved", "yes", "ok")
+            status_label = (
+                "Generating the core algorithm guidance..."
+                if approved else "Revising the proposal from your feedback..."
+            )
+            with st.status(status_label, expanded=True) as status:
+                phase = _continue_graph(graph, config, changes)
+                status.update(label="Checkpoint reached.", state="complete")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to generate the core code guidance: {exc}")
+
+elif st.session_state.phase == "graph_done":
+    _render_breadcrumb("graph_done")
+    state = st.session_state.state
+    st.markdown('<p class="aporia-step-label">Step 5</p>', unsafe_allow_html=True)
+    st.header("Core algorithm guidance is ready")
+    _render_evidence(state)
+    if state.get("research_proposal"):
+        with st.expander("Research proposal", expanded=False):
+            st.markdown(state["research_proposal"])
+    st.markdown(state.get("core_modification", ""))
+    st.download_button(
+        "Download core algorithm notes",
+        data=state.get("core_modification", ""),
+        file_name="core_algorithm.md",
+        mime="text/markdown",
+    )
+    if st.button("Continue to experiments", type="primary"):
+        st.session_state.phase = "experiment"
+        _persist_web_session()
+        st.rerun()
+
+# ──────────────────────────────────────────────
+# Phase: legacy running workflow
 # ──────────────────────────────────────────────
 
 elif st.session_state.phase == "running":
@@ -764,14 +1434,10 @@ elif st.session_state.phase == "running":
     with st.status("Initializing analysis pipeline...", expanded=True) as run_status:
         run_status.update(label="Deconstructing research landscape...")
         try:
-            profile = _build_profile_from_topic_and_insight(topic, state.get("user_insight", ""))
-            if not state.get("friction_points"):
-                state["friction_points"] = profile.get("friction_points", []) or []
-            if not state.get("motivation"):
-                state["motivation"] = profile.get("motivation", "") or ""
-            if not state.get("research_taste"):
-                state["research_taste"] = profile.get("research_taste", "") or ""
+            state = _run_ui_node(_legacy_profile_node, state)
             st.write("Research landscape mapped.")
+            st.session_state.state = state
+            _persist_web_session()
         except Exception as e:
             st.warning(f"Profile step had an issue: {e}. Continuing.")
             st.write("Research landscape mapped (with warnings).")
@@ -779,9 +1445,11 @@ elif st.session_state.phase == "running":
         run_status.update(label="Retrieving relevant literature...")
         try:
             from agents.idea_agent import paper_search_node
-            state = paper_search_node(state)
+            state = _run_ui_node(paper_search_node, state)
             n = len(state.get("raw_papers", []) or [])
             st.write(f"Retrieved {n} papers.")
+            st.session_state.state = state
+            _persist_web_session()
         except Exception as e:
             st.warning(f"Paper search had an issue: {e}. Continuing with no papers.")
             st.write("Paper search completed (with warnings).")
@@ -789,7 +1457,7 @@ elif st.session_state.phase == "running":
         run_status.update(label="Synthesizing structural hypotheses...")
         try:
             from agents.idea_agent import direction_synthesis_node
-            state = direction_synthesis_node(state)
+            state = _run_ui_node(direction_synthesis_node, state)
             if "raw_ideas" not in state:
                 dirs = state.get("candidate_directions", []) or []
                 state["raw_ideas"] = [
@@ -802,6 +1470,7 @@ elif st.session_state.phase == "running":
             run_status.update(label="Analysis complete.", state="complete")
             st.session_state.state = state
             st.session_state.phase = "idea_select"
+            _persist_web_session()
             st.rerun()
         except Exception as e:
             run_status.update(label="Error during synthesis.", state="error")
@@ -888,6 +1557,7 @@ elif st.session_state.phase == "idea_select":
                 state["selected_direction"] = dirs[selected_idx]
             st.session_state.state = state
             st.session_state.phase = "refining"
+            _persist_web_session()
             st.rerun()
 
 # ──────────────────────────────────────────────
@@ -907,34 +1577,37 @@ elif st.session_state.phase == "refining":
 
     from agents.refine_agent import gap_analysis_node, story_arc_node, proposal_node
 
-    with st.status("Assessing theoretical novelty...", expanded=True) as refine_status:
-        state = gap_analysis_node(state)
-        st.write("Assumptions identified and evaluated.")
+    if not (state.get("story_arc") and state.get("research_proposal")):
+        with st.status("Assessing theoretical novelty...", expanded=True) as refine_status:
+            state = _run_ui_node(gap_analysis_node, state)
+            st.write("Assumptions identified and evaluated.")
 
-        refine_status.update(label="Constructing narrative framework...")
-        novelty = state.get("novelty_score", 0)
-        feasibility = state.get("feasibility_score", 0)
+            refine_status.update(label="Constructing narrative framework...")
+            novelty = state.get("novelty_score", 0)
+            feasibility = state.get("feasibility_score", 0)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Novelty", f"{novelty:.0%}")
-            st.progress(int(novelty * 100))
-        with col2:
-            st.metric("Feasibility", f"{feasibility:.0%}")
-            st.progress(int(feasibility * 100))
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Novelty", f"{novelty:.0%}")
+                st.progress(int(novelty * 100))
+            with col2:
+                st.metric("Feasibility", f"{feasibility:.0%}")
+                st.progress(int(feasibility * 100))
 
-        if novelty < 0.6:
-            st.warning("Low novelty; consider adjusting the direction.")
-        if feasibility < 0.5:
-            st.warning("Low feasibility; consider simplifying the method.")
+            if novelty < 0.6:
+                st.warning("Low novelty; consider adjusting the direction.")
+            if feasibility < 0.5:
+                st.warning("Low feasibility; consider simplifying the method.")
 
-        state = story_arc_node(state)
-        st.write("Story arc constructed.")
+            state = _run_ui_node(story_arc_node, state)
+            st.write("Story arc constructed.")
 
-        refine_status.update(label="Drafting research proposal...")
-        state = proposal_node(state)
-        st.write("Proposal draft generated.")
-        refine_status.update(label="Refinement complete.", state="complete")
+            refine_status.update(label="Drafting research proposal...")
+            state = _run_ui_node(proposal_node, state)
+            st.write("Proposal draft generated.")
+            refine_status.update(label="Refinement complete.", state="complete")
+    else:
+        st.info("Restored the saved refinement and proposal results.")
 
     st.subheader("Story arc")
     st.markdown(state.get("story_arc", ""))
@@ -943,15 +1616,18 @@ elif st.session_state.phase == "refining":
     st.markdown(state.get("research_proposal", ""))
 
     st.session_state.state = state
+    _persist_web_session()
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Continue to experiments", type="primary"):
             st.session_state.phase = "experiment"
+            _persist_web_session()
             st.rerun()
     with col2:
         if st.button("Back to selection", type="secondary"):
             st.session_state.phase = "idea_select"
+            _persist_web_session()
             st.rerun()
 
 # ──────────────────────────────────────────────
@@ -971,15 +1647,21 @@ elif st.session_state.phase == "experiment":
 
     from agents.experiment_agent import github_search_node, code_modify_node, experiment_node
 
-    with st.status("Scanning open-source baselines...", expanded=True) as exp_status:
-        state = github_search_node(state)
-        repos = state.get("github_repos", []) or []
-        st.write(f"Found {len(repos)} candidate repositories.")
+    completed = (state.get("metadata") or {}).get("ui_completed_nodes", [])
+    if not state.get("baseline_code") or "code_modify_node" not in completed:
+        with st.status("Scanning open-source baselines...", expanded=True) as exp_status:
+            if not state.get("baseline_code"):
+                state = _run_ui_node(github_search_node, state)
+            repos = state.get("github_repos", []) or []
+            st.write(f"Found {len(repos)} candidate repositories.")
 
-        exp_status.update(label="Formulating code adaptation strategy...")
-        state = code_modify_node(state)
-        st.write("Adaptation strategy generated.")
-        exp_status.update(label="Processing complete.", state="complete")
+            exp_status.update(label="Formulating code adaptation strategy...")
+            if "code_modify_node" not in completed:
+                state = _run_ui_node(code_modify_node, state)
+            st.write("Adaptation strategy generated.")
+            exp_status.update(label="Processing complete.", state="complete")
+    else:
+        st.info("Restored the saved baseline and code-modification results.")
 
     st.subheader("Recommended baselines")
     st.markdown(state.get("baseline_code", ""))
@@ -999,14 +1681,16 @@ elif st.session_state.phase == "experiment":
     if st.button("Analyze results", disabled=not results):
         state["experiment_results"] = results
         with st.status("Evaluating experimental evidence...", expanded=True) as eval_status:
-            state = experiment_node(state)
+            state = _run_ui_node(experiment_node, state)
             eval_status.update(label="Analysis complete.", state="complete")
         st.markdown(state.get("ablation_plan", ""))
 
     st.session_state.state = state
+    _persist_web_session()
 
     if st.button("Continue to writing", type="primary"):
         st.session_state.phase = "writing"
+        _persist_web_session()
         st.rerun()
 
 # ──────────────────────────────────────────────
@@ -1024,37 +1708,24 @@ elif st.session_state.phase == "writing":
     )
     st.header("Writing")
 
-    with st.spinner("Structuring manuscript outline..."):
-        from agents.writing_agent import outline_node, draft_node, polish_node
-        state = outline_node(state)
+    from agents.writing_agent import outline_node, draft_node, polish_node
+    if not state.get("paper_outline"):
+        with st.spinner("Structuring manuscript outline..."):
+            state = _run_ui_node(outline_node, state)
+    else:
+        st.info("Restored the saved manuscript outline.")
 
     st.subheader("Outline")
     st.markdown(state.get("paper_outline", ""))
+    st.session_state.state = state
+    _persist_web_session()
 
     if st.button("Generate full draft", type="primary"):
-        write_progress = st.progress(0, text="Preparing to write...")
-        sections = ["abstract", "introduction", "related_work", "method", "experiments", "conclusion"]
-        drafts = {}
-
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from utils.llm_client import get_llm
-        llm = get_llm(temperature=0.6)
-
-        for i, section in enumerate(sections):
-            pct = int((i + 1) / len(sections) * 100)
-            write_progress.progress(pct, text=f"Composing {section} section...")
-            resp = llm.invoke([
-                SystemMessage(content=f"You are a top-tier conference paper writing expert. Write the {section} section in the user's language (match the language used in the input)."),
-                HumanMessage(content=f"Outline: {state.get('paper_outline','')[:600]}\nStory arc: {state.get('story_arc','')[:400]}\nWrite the {section} section."),
-            ])
-            drafts[section] = resp.content
-
-        state["draft_sections"] = drafts
-        state["full_draft"] = "\n\n".join(
-            f"## {s.upper()}\n\n{drafts[s]}" for s in sections if s in drafts
-        )
-        write_progress.progress(100, text="Draft complete.")
+        state = _run_ui_node(_compose_draft, state)
+        drafts = state["draft_sections"]
+        sections = list(drafts)
         st.session_state.state = state
+        _persist_web_session()
 
         st.success("Draft complete!")
         st.download_button(
